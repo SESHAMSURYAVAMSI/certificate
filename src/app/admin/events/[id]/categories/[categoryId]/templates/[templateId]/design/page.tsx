@@ -1,4 +1,3 @@
-
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -54,6 +53,19 @@ interface TemplateData {
   fields: DesignField[];
 }
 
+interface CategoryField {
+  key: string;
+  label: string;
+  type: string;
+  required?: boolean;
+}
+
+interface CategoryData {
+  _id: string;
+  name: string;
+  fields: CategoryField[];
+}
+
 const DEFAULT_FIELDS: {
   type: FieldType;
   label: string;
@@ -79,7 +91,7 @@ const DEFAULT_FIELDS: {
     type: "eventName",
     label: "Event Name",
     key: "event_name",
-    sample: "KSOGA 2026",
+    sample: "Conference Name",
     icon: Type,
   },
   {
@@ -103,11 +115,11 @@ const DEFAULT_FIELD_STYLE = {
   y: 48,
   width: 50,
   height: 9,
-  fontSize: 26,
+  fontSize: 28,
   fontFamily: "Helvetica",
   color: "#241000",
   align: "center" as const,
-  fontWeight: "normal" as const,
+  fontWeight: "bold" as const,
 };
 
 export default function CertificateDesignerPage() {
@@ -117,11 +129,15 @@ export default function CertificateDesignerPage() {
     templateId: string;
   }>();
 
-  const { id: eventId, categoryId, templateId } = params;
+  const eventId = params.id;
+  const categoryId = params.categoryId;
+  const templateId = params.templateId;
 
   const [template, setTemplate] = useState<TemplateData | null>(null);
+  const [category, setCategory] = useState<CategoryData | null>(null);
   const [fields, setFields] = useState<DesignField[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [fileUrl, setFileUrl] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -138,37 +154,59 @@ export default function CertificateDesignerPage() {
     height: number;
   } | null>(null);
 
-  const fileUrl = `/api/certificate-templates/${templateId}/file`;
-
-  const fetchTemplate = useCallback(async () => {
+  const fetchData = useCallback(async () => {
     try {
       setLoading(true);
       setError("");
 
-      const response = await fetch(
-        `/api/events/${eventId}/categories/${categoryId}/templates`,
-        { cache: "no-store" }
-      );
+      const [templateResponse, categoryResponse] = await Promise.all([
+        fetch(`/api/events/${eventId}/categories/${categoryId}/templates`, {
+          cache: "no-store",
+        }),
+        fetch(`/api/events/${eventId}/categories`, {
+          cache: "no-store",
+        }),
+      ]);
 
-      const result = await response.json();
+      const [templateResult, categoryResult] = await Promise.all([
+        templateResponse.json(),
+        categoryResponse.json(),
+      ]);
 
-      if (!response.ok || !result.success) {
-        throw new Error(result.message || "Unable to load templates.");
+      if (!templateResponse.ok || !templateResult.success) {
+        throw new Error(templateResult.message || "Unable to load templates.");
       }
 
-      const found = (result.templates as TemplateData[]).find(
-        (item) => item._id === templateId
+      if (!categoryResponse.ok || !categoryResult.success) {
+        throw new Error(categoryResult.message || "Unable to load category.");
+      }
+
+      const foundTemplate = (templateResult.templates || []).find(
+        (item: TemplateData) => item._id === templateId
       );
 
-      if (!found) {
+      const foundCategory = (categoryResult.categories || []).find(
+        (item: CategoryData & { _id: string }) => item._id === categoryId
+      );
+
+      if (!foundTemplate) {
         throw new Error("Certificate template not found.");
       }
 
-      setTemplate(found);
-      setFields(found.fields || []);
+      if (!foundCategory) {
+        throw new Error("Category not found.");
+      }
+
+      const loadedFields = (foundTemplate.fields || []) as DesignField[];
+
+      setTemplate(foundTemplate);
+      setCategory(foundCategory);
+      setFields(loadedFields);
+      setSelectedIndex(loadedFields.length ? 0 : -1);
+      setFileUrl(`/api/certificate-templates/${templateId}/file`);
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to load template."
+        err instanceof Error ? err.message : "Unable to load designer."
       );
     } finally {
       setLoading(false);
@@ -176,67 +214,78 @@ export default function CertificateDesignerPage() {
   }, [eventId, categoryId, templateId]);
 
   useEffect(() => {
-    void fetchTemplate();
-  }, [fetchTemplate]);
+    void fetchData();
+  }, [fetchData]);
 
-  const addField = (item: (typeof DEFAULT_FIELDS)[number]) => {
-    const existing = fields.filter((field) => field.type === item.type).length;
-
+  const addField = (item: {
+    type: FieldType;
+    label: string;
+    key: string;
+    sample: string;
+  }) => {
     const newField: DesignField = {
       ...DEFAULT_FIELD_STYLE,
-      key:
-        existing === 0
-          ? item.key
-          : `${item.key}_${existing + 1}`,
-      label: item.label,
-      type: item.type,
-      x: 25,
-      y: Math.min(20 + fields.length * 10, 85),
+      ...item,
     };
 
-    setFields((previous) => [...previous, newField]);
-    setSelectedIndex(fields.length);
+    setFields((previous) => {
+      const next = [...previous, newField];
+      setSelectedIndex(next.length - 1);
+      return next;
+    });
+
+    setError("");
     setSuccess("");
   };
 
-  const updateSelected = (
-    key: keyof DesignField,
-    value: string | number
+  const addCategoryField = (item: CategoryField) => {
+    if (fields.some((field) => field.key === item.key)) {
+      setError(`"${item.label}" is already on this certificate.`);
+      return;
+    }
+
+    addField({
+      type: "custom",
+      label: item.label,
+      key: item.key,
+      sample: item.label,
+    });
+  };
+
+  const updateSelected = <K extends keyof DesignField>(
+    key: K,
+    value: DesignField[K]
   ) => {
     setFields((previous) =>
       previous.map((field, index) =>
-        index === selectedIndex
-          ? { ...field, [key]: value }
-          : field
+        index === selectedIndex ? { ...field, [key]: value } : field
       )
     );
-    setSuccess("");
   };
 
   const removeSelected = () => {
-    setFields((previous) =>
-      previous.filter((_, index) => index !== selectedIndex)
-    );
-    setSelectedIndex((previous) => Math.max(0, previous - 1));
-    setSuccess("");
+    if (selectedIndex < 0) return;
+
+    setFields((previous) => {
+      const next = previous.filter((_, index) => index !== selectedIndex);
+      setSelectedIndex(next.length ? Math.min(selectedIndex, next.length - 1) : -1);
+      return next;
+    });
   };
 
   const startDrag = (
-    e: React.PointerEvent<HTMLDivElement>,
+    event: React.PointerEvent<HTMLDivElement>,
     index: number
   ) => {
     if (!stageRef.current) return;
-
-    e.preventDefault();
-    e.stopPropagation();
 
     const rect = stageRef.current.getBoundingClientRect();
     const field = fields[index];
 
     dragRef.current = {
       index,
-      startX: e.clientX,
-      startY: e.clientY,
+      startX: event.clientX,
+      startY: event.clientY,
       originalX: field.x,
       originalY: field.y,
       width: rect.width,
@@ -244,16 +293,15 @@ export default function CertificateDesignerPage() {
     };
 
     setSelectedIndex(index);
-    e.currentTarget.setPointerCapture(e.pointerId);
+    event.currentTarget.setPointerCapture(event.pointerId);
   };
 
-  const moveField = (e: React.PointerEvent<HTMLDivElement>) => {
+  const moveField = (event: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-
     if (!drag) return;
 
-    const deltaX = ((e.clientX - drag.startX) / drag.width) * 100;
-    const deltaY = ((e.clientY - drag.startY) / drag.height) * 100;
+    const deltaX = ((event.clientX - drag.startX) / drag.width) * 100;
+    const deltaY = ((event.clientY - drag.startY) / drag.height) * 100;
 
     setFields((previous) =>
       previous.map((field, index) => {
@@ -279,6 +327,11 @@ export default function CertificateDesignerPage() {
   };
 
   const saveDesign = async () => {
+    if (fields.length === 0) {
+      setError("Add at least one dynamic field before publishing.");
+      return;
+    }
+
     try {
       setSaving(true);
       setError("");
@@ -289,7 +342,10 @@ export default function CertificateDesignerPage() {
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fields }),
+          body: JSON.stringify({
+            fields,
+            status: "published",
+          }),
         }
       );
 
@@ -299,10 +355,13 @@ export default function CertificateDesignerPage() {
         throw new Error(result.message || "Unable to save design.");
       }
 
-      setSuccess("Certificate design saved successfully.");
       setTemplate((previous) =>
-        previous ? { ...previous, fields } : previous
+        previous
+          ? { ...previous, fields, status: "published" }
+          : previous
       );
+
+      setSuccess("Design saved and published successfully.");
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Unable to save design."
@@ -312,15 +371,15 @@ export default function CertificateDesignerPage() {
     }
   };
 
-  const selectedField = fields[selectedIndex];
-
   const getSampleText = (field: DesignField) => {
-    const item = DEFAULT_FIELDS.find(
-      (defaultField) => defaultField.type === field.type
+    const defaultField = DEFAULT_FIELDS.find(
+      (item) => item.type === field.type && item.key === field.key
     );
 
-    return item?.sample || field.label;
+    return defaultField?.sample || field.label;
   };
+
+  const selectedField = fields[selectedIndex];
 
   if (loading) {
     return (
@@ -340,7 +399,6 @@ export default function CertificateDesignerPage() {
 
   return (
     <div className="mx-auto max-w-[1600px] space-y-5 pb-12">
-      {/* Header */}
       <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
         <div>
           <Link
@@ -359,9 +417,10 @@ export default function CertificateDesignerPage() {
 
         <div className="flex flex-wrap gap-2">
           <button
+            type="button"
             onClick={() => {
               setFields(template.fields || []);
-              setSelectedIndex(0);
+              setSelectedIndex(template.fields?.length ? 0 : -1);
               setError("");
               setSuccess("");
             }}
@@ -372,6 +431,7 @@ export default function CertificateDesignerPage() {
           </button>
 
           <button
+            type="button"
             onClick={() => void saveDesign()}
             disabled={saving}
             className="inline-flex items-center gap-2 rounded-xl bg-[#EA580C] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#c94b08] disabled:opacity-60"
@@ -381,7 +441,7 @@ export default function CertificateDesignerPage() {
             ) : (
               <Save size={16} />
             )}
-            Save Design
+            Save & Publish
           </button>
         </div>
       </div>
@@ -399,35 +459,76 @@ export default function CertificateDesignerPage() {
       )}
 
       <div className="grid items-start gap-5 xl:grid-cols-[250px_minmax(0,1fr)_290px]">
-        {/* Left panel */}
         <aside className="rounded-2xl border border-[#f1e6df] bg-white p-5 shadow-sm">
-          <h2 className="font-bold text-[#241000]">Dynamic Fields</h2>
+          <h2 className="font-bold text-[#241000]">Standard Fields</h2>
           <p className="mt-1 text-xs leading-5 text-[#927e72]">
-            Select a field to add it to your certificate.
+            Add event and participant details.
           </p>
 
-          <div className="mt-5 space-y-2">
+          <div className="mt-4 space-y-2">
             {DEFAULT_FIELDS.map((item) => {
               const Icon = item.icon;
 
               return (
                 <button
-                  key={item.type}
+                  type="button"
+                  key={item.key}
                   onClick={() => addField(item)}
                   className="flex w-full items-center gap-3 rounded-xl border border-[#f1e6df] p-3 text-left transition hover:border-orange-200 hover:bg-[#fffaf7]"
                 >
-                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-orange-50">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-orange-50">
                     <Icon size={17} className="text-orange-600" />
-                  </div>
-
+                  </span>
                   <span className="flex-1 text-sm font-semibold text-[#49372c]">
                     {item.label}
                   </span>
-
                   <Plus size={15} className="text-orange-600" />
                 </button>
               );
             })}
+          </div>
+
+          <div className="mt-6 border-t border-[#f1e6df] pt-5">
+            <h2 className="font-bold text-[#241000]">Category Fields</h2>
+            <p className="mt-1 text-xs leading-5 text-[#927e72]">
+              These fields come from your participant form.
+            </p>
+
+            <div className="mt-3 space-y-2">
+              {(category?.fields || []).map((item) => {
+                const alreadyAdded = fields.some(
+                  (field) => field.type === "custom" && field.key === item.key
+                );
+
+                return (
+                  <button
+                    type="button"
+                    key={item.key}
+                    disabled={alreadyAdded}
+                    onClick={() => addCategoryField(item)}
+                    className="flex w-full items-center gap-2 rounded-xl border border-[#f1e6df] p-3 text-left text-sm transition hover:border-orange-200 hover:bg-[#fffaf7] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Type size={16} className="text-orange-600" />
+                    <span className="flex-1 truncate font-medium text-[#49372c]">
+                      {item.label}
+                    </span>
+                    {alreadyAdded ? (
+                      <span className="text-[10px] font-semibold text-emerald-600">
+                        Added
+                      </span>
+                    ) : (
+                      <Plus size={15} className="text-orange-600" />
+                    )}
+                  </button>
+                );
+              })}
+
+              {!category?.fields?.length && (
+                <p className="rounded-lg bg-[#fffaf7] p-3 text-xs text-[#927e72]">
+                  No custom participant fields are configured for this category.
+                </p>
+              )}
+            </div>
           </div>
 
           <div className="mt-6 rounded-xl bg-[#fffaf7] p-3">
@@ -441,7 +542,6 @@ export default function CertificateDesignerPage() {
           </div>
         </aside>
 
-        {/* Certificate preview */}
         <section className="min-w-0 rounded-2xl border border-[#f1e6df] bg-white p-4 shadow-sm sm:p-6">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <div>
@@ -450,9 +550,8 @@ export default function CertificateDesignerPage() {
                 Select and drag a field to position it.
               </p>
             </div>
-
             <span className="rounded-full bg-orange-50 px-3 py-1.5 text-[11px] font-semibold text-orange-700">
-              Landscape · Preview
+              Preview
             </span>
           </div>
 
@@ -479,7 +578,7 @@ export default function CertificateDesignerPage() {
               {fields.map((field, index) => (
                 <div
                   key={`${field.key}-${index}`}
-                  onPointerDown={(e) => startDrag(e, index)}
+                  onPointerDown={(event) => startDrag(event, index)}
                   onPointerMove={moveField}
                   onPointerUp={stopDrag}
                   onPointerCancel={stopDrag}
@@ -504,7 +603,6 @@ export default function CertificateDesignerPage() {
                   <span className="pointer-events-none w-full leading-tight">
                     {getSampleText(field)}
                   </span>
-
                   <Grip
                     size={12}
                     className="pointer-events-none absolute right-0.5 top-0.5 text-orange-600"
@@ -515,12 +613,10 @@ export default function CertificateDesignerPage() {
           </div>
 
           <p className="mt-3 text-[11px] leading-5 text-[#a18d81]">
-            The preview uses the uploaded file as its background. Position
-            values are stored as percentages of the certificate area.
+            Position values are stored as percentages of the certificate area.
           </p>
         </section>
 
-        {/* Right panel */}
         <aside className="rounded-2xl border border-[#f1e6df] bg-white p-5 shadow-sm">
           <h2 className="font-bold text-[#241000]">Field Properties</h2>
           <p className="mt-1 text-xs text-[#927e72]">
@@ -545,8 +641,8 @@ export default function CertificateDesignerPage() {
                 </label>
                 <input
                   value={selectedField.label}
-                  onChange={(e) =>
-                    updateSelected("label", e.target.value)
+                  onChange={(event) =>
+                    updateSelected("label", event.target.value)
                   }
                   className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400"
                 />
@@ -558,16 +654,22 @@ export default function CertificateDesignerPage() {
                 </label>
                 <input
                   value={selectedField.key}
-                  onChange={(e) =>
+                  readOnly={selectedField.type === "custom"}
+                  onChange={(event) =>
                     updateSelected(
                       "key",
-                      e.target.value
+                      event.target.value
                         .toLowerCase()
                         .replace(/[^a-z0-9_]/g, "_")
                     )
                   }
-                  className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400"
+                  className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400 read-only:bg-[#fffaf7]"
                 />
+                {selectedField.type === "custom" && (
+                  <p className="mt-1 text-[11px] text-[#927e72]">
+                    Custom keys are linked to the category participant form.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -576,8 +678,8 @@ export default function CertificateDesignerPage() {
                 </label>
                 <select
                   value={selectedField.fontFamily}
-                  onChange={(e) =>
-                    updateSelected("fontFamily", e.target.value)
+                  onChange={(event) =>
+                    updateSelected("fontFamily", event.target.value)
                   }
                   className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] bg-white px-3 text-sm outline-none focus:border-orange-400"
                 >
@@ -603,8 +705,8 @@ export default function CertificateDesignerPage() {
                   min="8"
                   max="80"
                   value={selectedField.fontSize}
-                  onChange={(e) =>
-                    updateSelected("fontSize", Number(e.target.value))
+                  onChange={(event) =>
+                    updateSelected("fontSize", Number(event.target.value))
                   }
                   className="mt-3 w-full accent-orange-600"
                 />
@@ -618,8 +720,8 @@ export default function CertificateDesignerPage() {
                   <input
                     type="color"
                     value={selectedField.color}
-                    onChange={(e) =>
-                      updateSelected("color", e.target.value)
+                    onChange={(event) =>
+                      updateSelected("color", event.target.value)
                     }
                     className="h-10 w-12 cursor-pointer rounded-lg border border-[#eee2da] bg-white p-1"
                   />
@@ -635,19 +737,17 @@ export default function CertificateDesignerPage() {
                 </label>
                 <div className="mt-2 grid grid-cols-3 gap-2">
                   {[
-                    { value: "left", icon: AlignLeft },
-                    { value: "center", icon: AlignCenter },
-                    { value: "right", icon: AlignRight },
+                    { value: "left" as const, icon: AlignLeft },
+                    { value: "center" as const, icon: AlignCenter },
+                    { value: "right" as const, icon: AlignRight },
                   ].map((item) => {
                     const Icon = item.icon;
 
                     return (
                       <button
-                        key={item.value}
                         type="button"
-                        onClick={() =>
-                          updateSelected("align", item.value)
-                        }
+                        key={item.value}
+                        onClick={() => updateSelected("align", item.value)}
                         className={`flex h-10 items-center justify-center rounded-lg border ${
                           selectedField.align === item.value
                             ? "border-orange-400 bg-orange-50 text-orange-600"
@@ -666,9 +766,7 @@ export default function CertificateDesignerPage() {
                 onClick={() =>
                   updateSelected(
                     "fontWeight",
-                    selectedField.fontWeight === "bold"
-                      ? "normal"
-                      : "bold"
+                    selectedField.fontWeight === "bold" ? "normal" : "bold"
                   )
                 }
                 className={`flex h-10 w-full items-center justify-center gap-2 rounded-lg border text-sm font-semibold ${
@@ -691,13 +789,15 @@ export default function CertificateDesignerPage() {
                     min="1"
                     max="100"
                     value={selectedField.width}
-                    onChange={(e) =>
-                      updateSelected("width", Number(e.target.value))
+                    onChange={(event) =>
+                      updateSelected(
+                        "width",
+                        Math.max(1, Math.min(100, Number(event.target.value)))
+                      )
                     }
-                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400"
+                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm"
                   />
                 </div>
-
                 <div>
                   <label className="text-xs font-semibold text-[#604a3d]">
                     Height %
@@ -707,10 +807,13 @@ export default function CertificateDesignerPage() {
                     min="1"
                     max="100"
                     value={selectedField.height}
-                    onChange={(e) =>
-                      updateSelected("height", Number(e.target.value))
+                    onChange={(event) =>
+                      updateSelected(
+                        "height",
+                        Math.max(1, Math.min(100, Number(event.target.value)))
+                      )
                     }
-                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400"
+                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm"
                   />
                 </div>
               </div>
@@ -725,13 +828,21 @@ export default function CertificateDesignerPage() {
                     min="0"
                     max={100 - selectedField.width}
                     value={Number(selectedField.x.toFixed(1))}
-                    onChange={(e) =>
-                      updateSelected("x", Number(e.target.value))
+                    onChange={(event) =>
+                      updateSelected(
+                        "x",
+                        Math.max(
+                          0,
+                          Math.min(
+                            100 - selectedField.width,
+                            Number(event.target.value)
+                          )
+                        )
+                      )
                     }
-                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400"
+                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm"
                   />
                 </div>
-
                 <div>
                   <label className="text-xs font-semibold text-[#604a3d]">
                     Position Y
@@ -741,10 +852,19 @@ export default function CertificateDesignerPage() {
                     min="0"
                     max={100 - selectedField.height}
                     value={Number(selectedField.y.toFixed(1))}
-                    onChange={(e) =>
-                      updateSelected("y", Number(e.target.value))
+                    onChange={(event) =>
+                      updateSelected(
+                        "y",
+                        Math.max(
+                          0,
+                          Math.min(
+                            100 - selectedField.height,
+                            Number(event.target.value)
+                          )
+                        )
+                      )
                     }
-                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm outline-none focus:border-orange-400"
+                    className="mt-1.5 h-10 w-full rounded-lg border border-[#eee2da] px-3 text-sm"
                   />
                 </div>
               </div>

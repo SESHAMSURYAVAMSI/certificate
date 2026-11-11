@@ -20,6 +20,7 @@ import {
   Settings2,
   Plus,
   ExternalLink,
+  RefreshCw,
 } from "lucide-react";
 
 type EventStatus = "draft" | "published" | "archived";
@@ -37,6 +38,22 @@ interface EventItem {
   status: EventStatus;
 }
 
+interface CategoryItem {
+  _id: string;
+  name: string;
+  slug: string;
+  description?: string;
+  isActive: boolean;
+  fields?: unknown[];
+}
+
+interface CategorySummary extends CategoryItem {
+  participantCount: number;
+  generatedCount: number;
+  downloadedCount: number;
+  totalDownloads: number;
+}
+
 export default function EventDetailsPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -52,6 +69,130 @@ export default function EventDetailsPage() {
   const [deleting, setDeleting] = useState(false);
 
   const categoriesUrl = `/admin/events/${id}/categories`;
+
+  const [categorySummaries, setCategorySummaries] = useState<CategorySummary[]>([]);
+  const [overviewLoading, setOverviewLoading] = useState(true);
+  const [overviewError, setOverviewError] = useState("");
+
+  const fetchOverview = useCallback(async (silent = false) => {
+    try {
+      if (!silent) {
+        setOverviewLoading(true);
+        setOverviewError("");
+      }
+
+      const categoriesResponse = await fetch(`/api/events/${id}/categories`, {
+        cache: "no-store",
+      });
+      const categoriesResult = await categoriesResponse.json();
+
+      if (!categoriesResponse.ok || !categoriesResult.success) {
+        throw new Error(categoriesResult.message || "Unable to load event categories.");
+      }
+
+      const categories: CategoryItem[] = Array.isArray(categoriesResult.categories)
+        ? categoriesResult.categories
+        : [];
+
+      const summaries = await Promise.all(
+        categories.map(async (category): Promise<CategorySummary> => {
+          const [participantsResult, certificatesResult] = await Promise.all([
+            fetch(
+              `/api/events/${id}/categories/${category._id}/participants?page=1&limit=1&status=active`,
+              { cache: "no-store" }
+            )
+              .then(async (response) => ({
+                ok: response.ok,
+                data: await response.json(),
+              }))
+              .catch(() => ({ ok: false, data: null })),
+            fetch(
+              `/api/events/${id}/categories/${category._id}/certificates/generate`,
+              { cache: "no-store" }
+            )
+              .then(async (response) => ({
+                ok: response.ok,
+                data: await response.json(),
+              }))
+              .catch(() => ({ ok: false, data: null })),
+          ]);
+
+          const pagination = participantsResult.data?.pagination;
+          const participantCount = Number(
+            pagination?.total ??
+              pagination?.totalItems ??
+              pagination?.totalCount ??
+              participantsResult.data?.total ??
+              0
+          );
+
+          const certificateStats =
+            certificatesResult.data?.stats ?? certificatesResult.data ?? {};
+
+          return {
+            ...category,
+            participantCount: Number.isFinite(participantCount) ? participantCount : 0,
+            generatedCount: Number(certificateStats.generatedCount ?? 0),
+            downloadedCount: Number(certificateStats.downloadedCount ?? 0),
+            totalDownloads: Number(certificateStats.totalDownloads ?? 0),
+          };
+        })
+      );
+
+      setCategorySummaries(summaries);
+    } catch (err) {
+      setOverviewError(
+        err instanceof Error ? err.message : "Unable to load event overview."
+      );
+    } finally {
+      if (!silent) {
+        setOverviewLoading(false);
+      }
+    }
+  }, [id]);
+
+  useEffect(() => {
+    void fetchOverview();
+
+    // Keep certificate and participant statistics current while this page is open.
+    const refreshInterval = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void fetchOverview(true);
+      }
+    }, 15_000);
+
+    const handleFocus = () => {
+      void fetchOverview(true);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void fetchOverview(true);
+      }
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(refreshInterval);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [fetchOverview]);
+
+  const totalParticipants = categorySummaries.reduce(
+    (total, category) => total + category.participantCount,
+    0
+  );
+  const totalGenerated = categorySummaries.reduce(
+    (total, category) => total + category.generatedCount,
+    0
+  );
+  const totalDownloaded = categorySummaries.reduce(
+    (total, category) => total + category.downloadedCount,
+    0
+  );
 
   const fetchEvent = useCallback(async () => {
     try {
@@ -126,6 +267,7 @@ export default function EventDetailsPage() {
 
       setEditing(false);
       setSuccess("Event updated successfully.");
+      void fetchOverview();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to update event.");
     } finally {
@@ -296,44 +438,50 @@ export default function EventDetailsPage() {
         {[
           {
             label: "Categories",
-            value: "Manage categories",
+            value: overviewLoading ? "…" : String(categorySummaries.length),
+            description: "Configured for this event",
             icon: Layers3,
             href: categoriesUrl,
           },
           {
             label: "Participants",
-            value: "Coming next",
+            value: overviewLoading ? "…" : totalParticipants.toLocaleString("en-IN"),
+            description: "Active participants across categories",
             icon: Users,
+            href: categoriesUrl,
           },
           {
             label: "Certificates",
-            value: "Coming next",
+            value: overviewLoading ? "…" : totalGenerated.toLocaleString("en-IN"),
+            description: `${totalDownloaded.toLocaleString("en-IN")} downloaded certificates`,
             icon: Award,
+            href: categoriesUrl,
           },
         ].map((item) => {
           const Icon = item.icon;
 
-          const content = (
-            <div className="rounded-2xl border border-[#f1e6df] bg-white p-5 shadow-sm transition hover:border-orange-200">
-              <div className="flex items-center justify-between">
-                <span className="text-sm text-[#927e72]">{item.label}</span>
-                <Icon size={20} className="text-orange-600" />
-              </div>
-              <p className="mt-4 text-lg font-bold text-[#241000]">
-                {item.value}
-              </p>
-            </div>
-          );
-
-          return item.href ? (
+          return (
             <Link key={item.label} href={item.href}>
-              {content}
+              <div className="h-full rounded-2xl border border-[#f1e6df] bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:border-orange-200 hover:shadow-md">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-[#927e72]">{item.label}</span>
+                  <Icon size={20} className="text-orange-600" />
+                </div>
+                <p className="mt-4 text-2xl font-bold tabular-nums text-[#241000]">
+                  {item.value}
+                </p>
+                <p className="mt-1 text-xs text-[#927e72]">{item.description}</p>
+              </div>
             </Link>
-          ) : (
-            <div key={item.label}>{content}</div>
           );
         })}
       </div>
+
+      {overviewError && (
+        <div className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          {overviewError}
+        </div>
+      )}
 
       {/* Event Information */}
       <section className="overflow-hidden rounded-2xl border border-[#f1e6df] bg-white shadow-sm">
@@ -519,55 +667,133 @@ export default function EventDetailsPage() {
       {/* Categories */}
       <section className="overflow-hidden rounded-2xl border border-[#f1e6df] bg-white p-6 shadow-sm">
         <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-          <div>
-            <div className="flex items-center gap-2">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-orange-50">
-                <Layers3 size={20} className="text-orange-600" />
-              </div>
-
-              <div>
-                <h2 className="font-bold text-[#241000]">
-                  Event Categories
-                </h2>
-                <p className="mt-1 text-xs text-[#927e72]">
-                  Configure participant fields and certificate designs.
-                </p>
-              </div>
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-orange-50">
+              <Layers3 size={20} className="text-orange-600" />
+            </div>
+            <div>
+              <h2 className="font-bold text-[#241000]">Event Categories</h2>
+              <p className="mt-1 text-xs text-[#927e72]">
+                Categories, participant records and certificate progress for this event.
+              </p>
             </div>
           </div>
 
-          <Link
-            href={categoriesUrl}
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#EA580C] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#c94b08]"
-          >
-            <Plus size={17} />
-            Manage Categories
-          </Link>
-        </div>
-
-        <div className="mt-6 rounded-xl border border-dashed border-[#eadbd1] bg-[#fffaf7] px-5 py-9 text-center">
-          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-white shadow-sm">
-            <Settings2 size={23} className="text-orange-500" />
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void fetchOverview()}
+              disabled={overviewLoading}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border border-[#eee2da] bg-white px-4 py-3 text-sm font-semibold text-[#604a3d] transition hover:bg-[#fffaf7] disabled:opacity-60"
+            >
+              <RefreshCw size={16} className={overviewLoading ? "animate-spin" : ""} />
+              Refresh
+            </button>
+            <Link
+              href={categoriesUrl}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#EA580C] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#c94b08]"
+            >
+              <Plus size={17} />
+              Manage Categories
+            </Link>
           </div>
-
-          <p className="mt-4 text-sm font-semibold text-[#49372c]">
-            Configure your event categories
-          </p>
-
-          <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-[#927e72]">
-            Create separate categories for participants, speakers, faculty,
-            awardees and other certificate types. Each category can have its
-            own custom fields.
-          </p>
-
-          <Link
-            href={categoriesUrl}
-            className="mt-5 inline-flex items-center gap-2 text-sm font-semibold text-orange-600 transition hover:text-orange-700"
-          >
-            Open Category Management
-            <ExternalLink size={14} />
-          </Link>
         </div>
+
+        {overviewLoading ? (
+          <div className="flex items-center justify-center gap-3 py-12 text-sm text-[#927e72]">
+            <Loader2 size={19} className="animate-spin text-orange-600" />
+            Loading categories and event statistics…
+          </div>
+        ) : categorySummaries.length === 0 ? (
+          <div className="mt-6 rounded-xl border border-dashed border-[#eadbd1] bg-[#fffaf7] px-5 py-10 text-center">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-white shadow-sm">
+              <Settings2 size={23} className="text-orange-500" />
+            </div>
+            <p className="mt-4 text-sm font-semibold text-[#49372c]">
+              No categories created yet
+            </p>
+            <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-[#927e72]">
+              Create categories for participants, speakers, faculty, awardees and other certificate types.
+            </p>
+            <Link
+              href={categoriesUrl}
+              className="mt-5 inline-flex items-center gap-2 text-sm font-semibold text-orange-600 transition hover:text-orange-700"
+            >
+              Create your first category
+              <ExternalLink size={14} />
+            </Link>
+          </div>
+        ) : (
+          <div className="mt-6 grid gap-4 lg:grid-cols-2">
+            {categorySummaries.map((category) => (
+              <article
+                key={category._id}
+                className="rounded-xl border border-[#f1e6df] bg-[#fffdfb] p-5 transition hover:border-orange-200"
+              >
+                <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="font-bold text-[#241000]">{category.name}</h3>
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                          category.isActive
+                            ? "bg-emerald-50 text-emerald-700"
+                            : "bg-stone-100 text-stone-600"
+                        }`}
+                      >
+                        {category.isActive ? "Active" : "Inactive"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-[#927e72]">
+                      /{category.slug}
+                    </p>
+                    {category.description && (
+                      <p className="mt-2 line-clamp-2 text-xs leading-5 text-[#806e63]">
+                        {category.description}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-5 grid grid-cols-3 gap-2">
+                  <div className="rounded-lg bg-white p-3">
+                    <p className="text-[11px] text-[#927e72]">Participants</p>
+                    <p className="mt-1 text-lg font-bold tabular-nums text-[#241000]">
+                      {category.participantCount.toLocaleString("en-IN")}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-white p-3">
+                    <p className="text-[11px] text-[#927e72]">Generated</p>
+                    <p className="mt-1 text-lg font-bold tabular-nums text-[#241000]">
+                      {category.generatedCount.toLocaleString("en-IN")}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-white p-3">
+                    <p className="text-[11px] text-[#927e72]">Downloaded</p>
+                    <p className="mt-1 text-lg font-bold tabular-nums text-[#241000]">
+                      {category.downloadedCount.toLocaleString("en-IN")}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2 border-t border-[#f1e6df] pt-4">
+                  <Link
+                    href={`${categoriesUrl}/${category._id}/participants`}
+                    className="inline-flex items-center gap-2 rounded-lg border border-[#eee2da] bg-white px-3 py-2 text-xs font-semibold text-[#604a3d] transition hover:border-orange-200 hover:text-orange-700"
+                  >
+                    <Users size={14} /> Participants
+                  </Link>
+                  <Link
+                    href={`${categoriesUrl}/${category._id}/certificates`}
+                    className="inline-flex items-center gap-2 rounded-lg border border-[#eee2da] bg-white px-3 py-2 text-xs font-semibold text-[#604a3d] transition hover:border-orange-200 hover:text-orange-700"
+                  >
+                    <Award size={14} /> Certificates
+                  </Link>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* Delete Event */}

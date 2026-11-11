@@ -1,4 +1,3 @@
-
 import { NextRequest, NextResponse } from "next/server";
 import { randomBytes } from "crypto";
 import mongoose from "mongoose";
@@ -7,7 +6,6 @@ import { connectDB } from "@/lib/mongodb";
 import { getAuthenticatedAdmin } from "@/lib/admin-auth";
 import Category from "@/models/Category";
 import Participant from "@/models/Participant";
-
 
 type RouteParams = {
   params: Promise<{
@@ -24,16 +22,20 @@ type CategoryField = {
   options?: string[];
 };
 
+type ParticipantData = Record<string, unknown>;
+
 function createCertificateId() {
   return `CERT-${randomBytes(5).toString("hex").toUpperCase()}`;
 }
 
 function getFieldValue(
-  data: Record<string, unknown>,
+  data: ParticipantData,
   field: CategoryField
-) {
+): string {
   const value = data[field.key];
-  return value === undefined || value === null ? "" : String(value).trim();
+  return value === undefined || value === null
+    ? ""
+    : String(value).trim();
 }
 
 function findNameField(fields: CategoryField[]) {
@@ -43,7 +45,9 @@ function findNameField(fields: CategoryField[]) {
         field.key.toLowerCase().replace(/[_\s-]/g, "")
       )
     ) ||
-    fields.find((field) => field.label.toLowerCase().includes("name"))
+    fields.find((field) =>
+      field.label.toLowerCase().includes("name")
+    )
   );
 }
 
@@ -73,7 +77,7 @@ function validateParticipantData(
     };
   }
 
-  const data = rawData as Record<string, unknown>;
+  const data = rawData as ParticipantData;
 
   for (const field of fields) {
     const value = getFieldValue(data, field);
@@ -96,13 +100,16 @@ function validateParticipantData(
       }
     }
 
-    if (field.type === "select" && value && field.options?.length) {
-      if (!field.options.includes(value)) {
-        return {
-          success: false as const,
-          message: `Invalid option for ${field.label}.`,
-        };
-      }
+    if (
+      field.type === "select" &&
+      value &&
+      field.options?.length &&
+      !field.options.includes(value)
+    ) {
+      return {
+        success: false as const,
+        message: `Invalid option for ${field.label}.`,
+      };
     }
   }
 
@@ -112,7 +119,7 @@ function validateParticipantData(
     return {
       success: false as const,
       message:
-        "A required participant name field is missing. Add a name field to this category first.",
+        "A participant name field is required. Add a name field to this category first.",
     };
   }
 
@@ -129,7 +136,28 @@ function validateParticipantData(
   };
 }
 
-export async function GET(request: NextRequest, context: RouteParams) {
+async function getRouteData(context: RouteParams) {
+  const { id, categoryId } = await context.params;
+
+  if (
+    !mongoose.isValidObjectId(id) ||
+    !mongoose.isValidObjectId(categoryId)
+  ) {
+    return {
+      error: NextResponse.json(
+        { success: false, message: "Invalid event or category ID." },
+        { status: 400 }
+      ),
+    };
+  }
+
+  return { id, categoryId };
+}
+
+export async function GET(
+  request: NextRequest,
+  context: RouteParams
+) {
   try {
     const admin = await getAuthenticatedAdmin();
 
@@ -142,17 +170,10 @@ export async function GET(request: NextRequest, context: RouteParams) {
 
     await connectDB();
 
-    const { id, categoryId } = await context.params;
+    const route = await getRouteData(context);
+    if ("error" in route) return route.error;
 
-    if (
-      !mongoose.isValidObjectId(id) ||
-      !mongoose.isValidObjectId(categoryId)
-    ) {
-      return NextResponse.json(
-        { success: false, message: "Invalid event or category ID." },
-        { status: 400 }
-      );
-    }
+    const { id, categoryId } = route;
 
     const category = await Category.findOne({
       _id: categoryId,
@@ -168,9 +189,13 @@ export async function GET(request: NextRequest, context: RouteParams) {
 
     const { searchParams } = new URL(request.url);
 
-    const page = Math.max(1, Number(searchParams.get("page")) || 1);
+    const page = Math.max(
+      1,
+      Number(searchParams.get("page")) || 1
+    );
+
     const limit = Math.min(
-      100,
+      500,
       Math.max(1, Number(searchParams.get("limit")) || 10)
     );
 
@@ -222,9 +247,12 @@ export async function GET(request: NextRequest, context: RouteParams) {
   }
 }
 
-export async function POST(request: NextRequest, context: RouteParams) {
+export async function POST(
+  request: NextRequest,
+  context: RouteParams
+) {
   try {
-   const admin = await getAuthenticatedAdmin();
+    const admin = await getAuthenticatedAdmin();
 
     if (!admin) {
       return NextResponse.json(
@@ -235,17 +263,10 @@ export async function POST(request: NextRequest, context: RouteParams) {
 
     await connectDB();
 
-    const { id, categoryId } = await context.params;
+    const route = await getRouteData(context);
+    if ("error" in route) return route.error;
 
-    if (
-      !mongoose.isValidObjectId(id) ||
-      !mongoose.isValidObjectId(categoryId)
-    ) {
-      return NextResponse.json(
-        { success: false, message: "Invalid event or category ID." },
-        { status: 400 }
-      );
-    }
+    const { id, categoryId } = route;
 
     const category = await Category.findOne({
       _id: categoryId,
@@ -274,7 +295,7 @@ export async function POST(request: NextRequest, context: RouteParams) {
       );
     }
 
-    // Single participant
+    // Add one participant.
     if (body.data) {
       const result = validateParticipantData(body.data, fields);
 
@@ -324,7 +345,7 @@ export async function POST(request: NextRequest, context: RouteParams) {
       );
     }
 
-    // Bulk import
+    // Bulk import.
     if (Array.isArray(body.participants)) {
       if (body.participants.length === 0) {
         return NextResponse.json(
@@ -343,12 +364,12 @@ export async function POST(request: NextRequest, context: RouteParams) {
         );
       }
 
-      const createdDocuments = [];
-      const skipped: {
+      const documents: Array<Record<string, unknown>> = [];
+      const skipped: Array<{
         row: number;
         name: string;
         reason: string;
-      }[] = [];
+      }> = [];
 
       const seenEmails = new Set<string>();
 
@@ -385,7 +406,7 @@ export async function POST(request: NextRequest, context: RouteParams) {
           seenEmails.add(result.normalizedEmail);
         }
 
-        createdDocuments.push({
+        documents.push({
           eventId: new mongoose.Types.ObjectId(id),
           categoryId: new mongoose.Types.ObjectId(categoryId),
           certificateId: createCertificateId(),
@@ -399,10 +420,10 @@ export async function POST(request: NextRequest, context: RouteParams) {
 
       let created = 0;
 
-      if (createdDocuments.length > 0) {
-        const emails = createdDocuments
+      if (documents.length > 0) {
+        const emails = documents
           .map((item) => item.normalizedEmail)
-          .filter((email): email is string => Boolean(email));
+          .filter((email): email is string => typeof email === "string");
 
         const existing = emails.length
           ? await Participant.find({
@@ -418,14 +439,13 @@ export async function POST(request: NextRequest, context: RouteParams) {
           existing.map((item) => item.normalizedEmail)
         );
 
-        const finalDocuments = createdDocuments.filter((item, index) => {
-          if (
-            item.normalizedEmail &&
-            existingEmails.has(item.normalizedEmail)
-          ) {
+        const finalDocuments = documents.filter((item) => {
+          const email = item.normalizedEmail as string | undefined;
+
+          if (email && existingEmails.has(email)) {
             skipped.push({
-              row: index + 1,
-              name: item.participantName,
+              row: 0,
+              name: String(item.participantName || ""),
               reason: "Email already exists in this category.",
             });
             return false;
@@ -435,9 +455,10 @@ export async function POST(request: NextRequest, context: RouteParams) {
         });
 
         if (finalDocuments.length > 0) {
-          const inserted = await Participant.insertMany(finalDocuments, {
-            ordered: false,
-          });
+          const inserted = await Participant.insertMany(
+            finalDocuments,
+            { ordered: false }
+          );
           created = inserted.length;
         }
       }
@@ -471,7 +492,8 @@ export async function POST(request: NextRequest, context: RouteParams) {
       return NextResponse.json(
         {
           success: false,
-          message: "A participant with this email or certificate ID already exists.",
+          message:
+            "A participant with this email or certificate ID already exists.",
         },
         { status: 409 }
       );

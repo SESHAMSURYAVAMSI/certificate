@@ -13,6 +13,8 @@ export interface IGeneratedCertificate {
   status: "generated" | "revoked";
   generatedBy: string;
   generatedAt: Date;
+  downloadCount: number;
+  lastDownloadedAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -75,6 +77,15 @@ const GeneratedCertificateSchema =
         type: Date,
         default: Date.now,
       },
+      downloadCount: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      lastDownloadedAt: {
+        type: Date,
+        default: null,
+      },
     },
     { timestamps: true }
   );
@@ -84,6 +95,13 @@ GeneratedCertificateSchema.index({
   categoryId: 1,
   participantId: 1,
   generatedAt: -1,
+});
+
+GeneratedCertificateSchema.index({
+  eventId: 1,
+  categoryId: 1,
+  status: 1,
+  downloadCount: 1,
 });
 
 const GeneratedCertificate: Model<IGeneratedCertificate> =

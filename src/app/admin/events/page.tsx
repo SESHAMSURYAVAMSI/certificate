@@ -18,6 +18,9 @@ import {
   CalendarCheck,
   Clock3,
   Archive,
+  Copy,
+  ExternalLink,
+  Check,
 } from "lucide-react";
 
 type EventStatus = "draft" | "published" | "archived";
@@ -43,6 +46,7 @@ export default function EventsPage() {
   const [filter, setFilter] = useState<FilterType>("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [copiedSlug, setCopiedSlug] = useState("");
 
   const fetchEvents = useCallback(async () => {
     try {
@@ -123,6 +127,18 @@ export default function EventsPage() {
       month: "short",
       year: "numeric",
     });
+
+  async function copyPublicUrl(slug: string) {
+    const publicUrl = `${window.location.origin}/public/${slug}`;
+
+    try {
+      await navigator.clipboard.writeText(publicUrl);
+      setCopiedSlug(slug);
+      window.setTimeout(() => setCopiedSlug(""), 2000);
+    } catch {
+      setError("Unable to copy the public URL. Please copy it from the address bar.");
+    }
+  }
 
   const statusStyles: Record<EventStatus, string> = {
     published: "bg-emerald-50 text-emerald-700",
@@ -346,6 +362,29 @@ export default function EventsPage() {
                     <Pencil size={15} />
                     Manage
                   </Link>
+
+                  {event.status === "published" && (
+                    <>
+                      <Link
+                        href={`/public/${event.slug}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100"
+                      >
+                        <ExternalLink size={14} />
+                        Public Page
+                      </Link>
+                      <button
+                        type="button"
+                        onClick={() => void copyPublicUrl(event.slug)}
+                        title="Copy public event URL"
+                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[#eee2da] px-3 text-xs font-semibold text-[#604a3d] transition hover:border-orange-200 hover:bg-orange-50 hover:text-orange-700"
+                      >
+                        {copiedSlug === event.slug ? <Check size={14} /> : <Copy size={14} />}
+                        {copiedSlug === event.slug ? "Copied" : "Copy URL"}
+                      </button>
+                    </>
+                  )}
 
                   <button
                     type="button"

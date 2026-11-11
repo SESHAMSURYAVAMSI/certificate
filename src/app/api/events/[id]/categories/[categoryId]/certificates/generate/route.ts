@@ -1,20 +1,24 @@
-
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 import { GridFSBucket, ObjectId } from "mongodb";
-import { PDFDocument, StandardFonts, rgb, type PDFFont } from "pdf-lib";
-import JSZip from "jszip";
-import { Readable } from "node:stream";
-import { NextRequest, NextResponse } from "next/server";
+import {
+  PDFDocument,
+  StandardFonts,
+  rgb,
+  type PDFFont,
+  type PDFPage,
+} from "pdf-lib";
+import fontkit from "@pdf-lib/fontkit";
 
 import { connectDB } from "@/lib/mongodb";
 import { getAuthenticatedAdmin } from "@/lib/admin-auth";
 import Event from "@/models/Event";
 import Category from "@/models/Category";
-import Participant from "@/models/Participant";
 import CertificateTemplate from "@/models/CertificateTemplate";
+import Participant from "@/models/Participant";
 import GeneratedCertificate from "@/models/GeneratedCertificate";
 
-type RouteParams = {
+type RouteContext = {
   params: Promise<{
     id: string;
     categoryId: string;
@@ -42,126 +46,123 @@ type TemplateField = {
   fontWeight: "normal" | "bold";
 };
 
-type ParticipantData = {
+type CategoryField = {
+  key: string;
+  label: string;
+  type: string;
+};
+
+type ParticipantRecord = {
   _id: mongoose.Types.ObjectId;
   certificateId: string;
   participantName: string;
   email?: string;
-  data: Record<string, unknown>;
+  data?: Record<string, unknown>;
 };
 
-const TEMPLATE_BUCKET = "certificateTemplates";
-const CERTIFICATE_BUCKET = "generatedCertificates";
-const MAX_PARTICIPANTS = 500;
+function getBucket(bucketName: string) {
+  const db = mongoose.connection.db;
 
-function streamToBuffer(
+  if (!db) {
+    throw new Error("MongoDB connection is not available.");
+  }
+
+  return new GridFSBucket(db, { bucketName });
+}
+
+async function streamToBuffer(
   stream: NodeJS.ReadableStream
 ): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
+  const chunks: Buffer[] = [];
 
-    stream.on("data", (chunk: Buffer | Uint8Array) => {
-      chunks.push(Buffer.from(chunk));
+  return new Promise((resolve, reject) => {
+    stream.on("data", (chunk: Buffer | Uint8Array | string) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
 
     stream.on("error", reject);
-
-    stream.on("end", () => {
-      resolve(Buffer.concat(chunks));
-    });
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
   });
 }
 
 async function readGridFSFile(
-  bucket: GridFSBucket,
-  fileId: mongoose.Types.ObjectId
-) {
-  return streamToBuffer(
-    bucket.openDownloadStream(new ObjectId(fileId.toString()))
-  );
+  bucketName: string,
+  fileId: ObjectId
+): Promise<Buffer> {
+  const bucket = getBucket(bucketName);
+  const files = await bucket.find({ _id: fileId }).toArray();
+
+  if (!files.length) {
+    throw new Error("Certificate template file was not found.");
+  }
+
+  return streamToBuffer(bucket.openDownloadStream(fileId));
 }
 
 async function uploadGridFSFile(
-  bucket: GridFSBucket,
+  bucketName: string,
   buffer: Buffer,
-  fileName: string,
+  filename: string,
   metadata: Record<string, unknown>
-) {
-  const uploadStream = bucket.openUploadStream(fileName, {
-    metadata,
+): Promise<ObjectId> {
+  const bucket = getBucket(bucketName);
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = bucket.openUploadStream(filename, {
+      metadata: {
+        ...metadata,
+        contentType: "application/pdf",
+      },
+    });
+
+    uploadStream.on("error", reject);
+    uploadStream.on("finish", () => resolve(uploadStream.id as ObjectId));
+    uploadStream.end(buffer);
   });
-
-  await new Promise<void>((resolve, reject) => {
-    Readable.from(buffer)
-      .pipe(uploadStream)
-      .on("finish", resolve)
-      .on("error", reject);
-  });
-
-  return uploadStream.id as ObjectId;
-}
-
-function getFont(
-  family: string,
-  bold: boolean
-): typeof StandardFonts[keyof typeof StandardFonts] {
-  const normalized = family.toLowerCase();
-
-  if (normalized.includes("times")) {
-    return bold ? StandardFonts.TimesRomanBold : StandardFonts.TimesRoman;
-  }
-
-  if (normalized.includes("courier")) {
-    return bold ? StandardFonts.CourierBold : StandardFonts.Courier;
-  }
-
-  return bold ? StandardFonts.HelveticaBold : StandardFonts.Helvetica;
 }
 
 function parseColor(hex: string) {
-  const normalized = /^#[0-9a-fA-F]{6}$/.test(hex)
-    ? hex.slice(1)
-    : "000000";
+  const clean = hex.replace("#", "");
+  const red = parseInt(clean.slice(0, 2), 16) / 255;
+  const green = parseInt(clean.slice(2, 4), 16) / 255;
+  const blue = parseInt(clean.slice(4, 6), 16) / 255;
 
-  return rgb(
-    parseInt(normalized.slice(0, 2), 16) / 255,
-    parseInt(normalized.slice(2, 4), 16) / 255,
-    parseInt(normalized.slice(4, 6), 16) / 255
-  );
+  return rgb(red, green, blue);
 }
 
 function formatEventDates(startDate: Date, endDate: Date) {
-  const options: Intl.DateTimeFormatOptions = {
-    day: "numeric",
+  const formatter = new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
     month: "long",
     year: "numeric",
-  };
+  });
 
-  const start = new Date(startDate).toLocaleDateString("en-IN", options);
-  const end = new Date(endDate).toLocaleDateString("en-IN", options);
+  const start = formatter.format(new Date(startDate));
+  const end = formatter.format(new Date(endDate));
 
-  return start === end ? start : `${start} - ${end}`;
+  return start === end ? start : `${start} – ${end}`;
 }
 
 function getFieldText(
   field: TemplateField,
-  participant: ParticipantData,
+  participant: ParticipantRecord,
   event: {
     name: string;
     startDate: Date;
     endDate: Date;
-    venue: string;
-    city: string;
-  }
-) {
-  const data = participant.data || {};
+    venue?: string;
+    city?: string;
+  },
+  categoryFields: CategoryField[]
+): string {
+  const participantData = participant.data || {};
 
   switch (field.type) {
     case "participantName":
-      return participant.participantName;
+      return participant.participantName || "";
 
     case "eventName":
-      return event.name;
+      return event.name || "";
 
     case "eventDates":
       return formatEventDates(event.startDate, event.endDate);
@@ -170,38 +171,43 @@ function getFieldText(
       return [event.venue, event.city].filter(Boolean).join(", ");
 
     case "workshopTitle": {
-      const direct = data[field.key];
+      const directValue = participantData[field.key];
 
-      if (direct !== undefined && direct !== null && String(direct).trim()) {
-        return String(direct);
+      if (directValue !== undefined && directValue !== null) {
+        return String(directValue);
       }
 
       const candidates = [
         "workshop_title",
-        "workshopTitle",
+        "presentation_title",
         "title",
         "topic",
-        "presentation_title",
-        "presentationTitle",
+        "session_title",
       ];
 
       for (const key of candidates) {
-        const value = data[key];
+        const value = participantData[key];
 
         if (value !== undefined && value !== null && String(value).trim()) {
           return String(value);
         }
       }
 
+      const matchingField = categoryFields.find(
+        (item) => item.key === field.key
+      );
+
+      if (matchingField) {
+        const value = participantData[matchingField.key];
+        return value === undefined || value === null ? "" : String(value);
+      }
+
       return "";
     }
 
     case "custom": {
-      const value = data[field.key];
-
-      return value === undefined || value === null
-        ? ""
-        : String(value);
+      const value = participantData[field.key];
+      return value === undefined || value === null ? "" : String(value);
     }
 
     default:
@@ -214,103 +220,134 @@ function wrapText(
   font: PDFFont,
   fontSize: number,
   maxWidth: number
-) {
+): string[] {
   const paragraphs = text.split(/\r?\n/);
   const lines: string[] = [];
 
   for (const paragraph of paragraphs) {
     const words = paragraph.split(/\s+/).filter(Boolean);
 
-    if (words.length === 0) {
+    if (!words.length) {
       lines.push("");
       continue;
     }
 
-    let currentLine = "";
+    let line = "";
 
     for (const word of words) {
-      const candidate = currentLine
-        ? `${currentLine} ${word}`
-        : word;
+      const candidate = line ? `${line} ${word}` : word;
 
-      if (
-        font.widthOfTextAtSize(candidate, fontSize) <= maxWidth ||
-        !currentLine
-      ) {
-        currentLine = candidate;
+      if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
+        line = candidate;
+        continue;
+      }
+
+      if (line) {
+        lines.push(line);
+        line = "";
+      }
+
+      // Split a single long word if it is wider than the field.
+      if (font.widthOfTextAtSize(word, fontSize) > maxWidth) {
+        let part = "";
+
+        for (const character of word) {
+          const next = part + character;
+
+          if (
+            part &&
+            font.widthOfTextAtSize(next, fontSize) > maxWidth
+          ) {
+            lines.push(part);
+            part = character;
+          } else {
+            part = next;
+          }
+        }
+
+        line = part;
       } else {
-        lines.push(currentLine);
-        currentLine = word;
+        line = word;
       }
     }
 
-    if (currentLine) {
-      lines.push(currentLine);
-    }
+    if (line) lines.push(line);
   }
 
   return lines;
+}
+
+function getFontFamily(
+  fontFamily: string,
+  fontWeight: "normal" | "bold"
+) {
+  const family = fontFamily.toLowerCase();
+
+  if (family.includes("courier")) {
+    return fontWeight === "bold"
+      ? StandardFonts.CourierBold
+      : StandardFonts.Courier;
+  }
+
+  if (family.includes("times")) {
+    return fontWeight === "bold"
+      ? StandardFonts.TimesRomanBold
+      : StandardFonts.TimesRoman;
+  }
+
+  return fontWeight === "bold"
+    ? StandardFonts.HelveticaBold
+    : StandardFonts.Helvetica;
 }
 
 async function createCertificatePDF(
   templateBuffer: Buffer,
   mimeType: string,
   fields: TemplateField[],
-  participant: ParticipantData,
+  participant: ParticipantRecord,
   event: {
     name: string;
     startDate: Date;
     endDate: Date;
-    venue: string;
-    city: string;
-  }
-) {
-  const pdfDoc = await PDFDocument.create();
+    venue?: string;
+    city?: string;
+  },
+  categoryFields: CategoryField[]
+): Promise<Buffer> {
+  const outputDocument = await PDFDocument.create();
+  outputDocument.registerFontkit(fontkit);
 
-  let pageWidth = 0;
-  let pageHeight = 0;
+  let page: PDFPage;
+  let pageWidth: number;
+  let pageHeight: number;
 
   if (mimeType === "application/pdf") {
-    const sourcePdf = await PDFDocument.load(templateBuffer, {
-      ignoreEncryption: false,
-    });
+    const sourceDocument = await PDFDocument.load(templateBuffer);
+    const copiedPages = await outputDocument.copyPages(sourceDocument, [0]);
 
-    const sourcePages = sourcePdf.getPages();
+    page = copiedPages[0];
+    outputDocument.addPage(page);
 
-    if (sourcePages.length === 0) {
-      throw new Error("The uploaded PDF has no pages.");
-    }
+    pageWidth = page.getWidth();
+    pageHeight = page.getHeight();
+  } else if (mimeType === "image/png") {
+    const image = await outputDocument.embedPng(templateBuffer);
+    pageWidth = image.width;
+    pageHeight = image.height;
 
-    const firstPage = sourcePages[0];
-    const dimensions = firstPage.getSize();
-
-    pageWidth = dimensions.width;
-    pageHeight = dimensions.height;
-
-    const embeddedPages = await pdfDoc.embedPdf(
-      templateBuffer,
-      [0]
-    );
-
-    const page = pdfDoc.addPage([pageWidth, pageHeight]);
-
-    page.drawPage(embeddedPages[0], {
+    page = outputDocument.addPage([pageWidth, pageHeight]);
+    page.drawImage(image, {
       x: 0,
       y: 0,
       width: pageWidth,
       height: pageHeight,
     });
-  } else if (mimeType === "image/png" || mimeType === "image/jpeg") {
-    const image =
-      mimeType === "image/png"
-        ? await pdfDoc.embedPng(templateBuffer)
-        : await pdfDoc.embedJpg(templateBuffer);
-
+  } else if (mimeType === "image/jpeg") {
+    const image = await outputDocument.embedJpg(templateBuffer);
     pageWidth = image.width;
     pageHeight = image.height;
 
-    const page = pdfDoc.addPage([pageWidth, pageHeight]);
-
+    page = outputDocument.addPage([pageWidth, pageHeight]);
     page.drawImage(image, {
       x: 0,
       y: 0,
@@ -318,87 +355,152 @@ async function createCertificatePDF(
       height: pageHeight,
     });
   } else {
-    throw new Error("Unsupported certificate template format.");
+    throw new Error("Unsupported certificate template file type.");
   }
 
-  const page = pdfDoc.getPages()[0];
-
   for (const field of fields) {
-    const text = getFieldText(field, participant, event);
+    const text = getFieldText(
+      field,
+      participant,
+      event,
+      categoryFields
+    ).trim();
 
-    if (!text.trim()) continue;
+    if (!text) continue;
 
-    const fontName = getFont(
-      field.fontFamily,
-      field.fontWeight === "bold"
+    const font = await outputDocument.embedFont(
+      getFontFamily(field.fontFamily, field.fontWeight)
     );
 
-    const font = await pdfDoc.embedFont(fontName);
+    const x = (field.x / 100) * pageWidth;
+    const top = (field.y / 100) * pageHeight;
+    const width = (field.width / 100) * pageWidth;
+    const height = (field.height / 100) * pageHeight;
 
-    const fontSize = Math.max(6, Math.min(200, field.fontSize));
-
-    const boxX = (field.x / 100) * pageWidth;
-    const boxWidth = (field.width / 100) * pageWidth;
-    const boxHeight = (field.height / 100) * pageHeight;
-
-    // Designer Y is measured from the top; PDF Y is measured from the bottom.
-    const boxTop = (field.y / 100) * pageHeight;
-
-    const padding = 2;
-    const textWidth = Math.max(1, boxWidth - padding * 2);
-
-    const lines = wrapText(text, font, fontSize, textWidth);
+    const fontSize = Math.max(6, field.fontSize);
     const lineHeight = fontSize * 1.2;
+    const lines = wrapText(text, font, fontSize, width);
 
     const maxLines = Math.max(
       1,
-      Math.floor((boxHeight - padding * 2) / lineHeight)
+      Math.floor(height / lineHeight)
     );
 
     const visibleLines = lines.slice(0, maxLines);
-    const totalTextHeight = visibleLines.length * lineHeight;
+    const color = parseColor(field.color);
 
-    const verticalOffset = Math.max(
-      0,
-      (boxHeight - totalTextHeight) / 2
-    );
-
-    for (let index = 0; index < visibleLines.length; index++) {
-      const line = visibleLines[index];
-
+    visibleLines.forEach((line, index) => {
       const lineWidth = font.widthOfTextAtSize(line, fontSize);
 
-      let drawX = boxX + padding;
+      let drawX = x;
 
       if (field.align === "center") {
-        drawX = boxX + (boxWidth - lineWidth) / 2;
+        drawX = x + Math.max(0, (width - lineWidth) / 2);
       } else if (field.align === "right") {
-        drawX = boxX + boxWidth - padding - lineWidth;
+        drawX = x + Math.max(0, width - lineWidth);
       }
 
-      const drawY =
-        pageHeight -
-        boxTop -
-        verticalOffset -
-        fontSize -
-        index * lineHeight;
+      const baselineY =
+        pageHeight - top - fontSize - index * lineHeight;
 
       page.drawText(line, {
         x: drawX,
-        y: drawY,
+        y: baselineY,
         size: fontSize,
         font,
-        color: parseColor(field.color),
+        color,
+        maxWidth: width,
       });
-    }
+    });
   }
 
-  return Buffer.from(await pdfDoc.save());
+  return Buffer.from(await outputDocument.save());
+}
+
+export async function GET(_request: NextRequest, context: RouteContext) {
+  try {
+    const admin = await getAuthenticatedAdmin();
+    if (!admin) {
+      return NextResponse.json({ success: false, message: "Unauthorized." }, { status: 401 });
+    }
+
+    const { id, categoryId } = await context.params;
+    if (!mongoose.isValidObjectId(id) || !mongoose.isValidObjectId(categoryId)) {
+      return NextResponse.json({ success: false, message: "Invalid event or category ID." }, { status: 400 });
+    }
+
+    await connectDB();
+    // Use ObjectIds and a literal status so the filter matches the Mongoose schema.
+    const filter = {
+      eventId: new mongoose.Types.ObjectId(id),
+      categoryId: new mongoose.Types.ObjectId(categoryId),
+      status: "generated" as const,
+    };
+
+    const [
+      generatedCount,
+      downloadedCount,
+      downloadAggregate,
+      generatedRecords,
+    ] = await Promise.all([
+      GeneratedCertificate.countDocuments(filter),
+      GeneratedCertificate.countDocuments({
+        ...filter,
+        downloadCount: { $gt: 0 },
+      }),
+      GeneratedCertificate.aggregate([
+        {
+          $match: {
+            eventId: filter.eventId,
+            categoryId: filter.categoryId,
+            status: filter.status,
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: {
+              $sum: {
+                $ifNull: ["$downloadCount", 0],
+              },
+            },
+          },
+        },
+      ]),
+      GeneratedCertificate.find(filter)
+        .select({ participantId: 1 })
+        .lean()
+        .exec() as unknown as Array<{
+        participantId: mongoose.Types.ObjectId;
+      }>,
+    ]);
+
+    const stats = {
+      generatedCount,
+      downloadedCount,
+      totalDownloads: Number(downloadAggregate[0]?.total || 0),
+      generatedParticipantIds: generatedRecords.map((record) =>
+        String(record.participantId),
+      ),
+    };
+
+    // Keep the nested shape for existing pages and expose top-level aliases
+    // for dashboard/event pages that read the original response format.
+    return NextResponse.json({
+      success: true,
+      ...stats,
+      stats,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Certificate statistics error:", error);
+    return NextResponse.json({ success: false, message: "Unable to load certificate statistics." }, { status: 500 });
+  }
 }
 
 export async function POST(
   request: NextRequest,
-  context: RouteParams
+  context: RouteContext
 ) {
   const uploadedFileIds: ObjectId[] = [];
 
@@ -411,8 +513,6 @@ export async function POST(
         { status: 401 }
       );
     }
-
-    await connectDB();
 
     const { id, categoryId } = await context.params;
 
@@ -429,49 +529,63 @@ export async function POST(
     const body = await request.json();
 
     const templateId = String(body.templateId || "");
+    const singleParticipantId = body.participantId
+      ? String(body.participantId)
+      : "";
+
     const participantIds: string[] = Array.isArray(body.participantIds)
       ? body.participantIds.map(String)
-      : body.participantId
-        ? [String(body.participantId)]
+      : singleParticipantId
+        ? [singleParticipantId]
         : [];
 
     if (!mongoose.isValidObjectId(templateId)) {
       return NextResponse.json(
-        { success: false, message: "A valid template ID is required." },
+        { success: false, message: "Invalid certificate template ID." },
         { status: 400 }
       );
     }
 
-    if (
-      participantIds.length === 0 ||
-      participantIds.length > MAX_PARTICIPANTS ||
-      participantIds.some((participantId) =>
-        !mongoose.isValidObjectId(participantId)
-      )
-    ) {
+    if (!participantIds.length) {
+      return NextResponse.json(
+        { success: false, message: "Select at least one participant." },
+        { status: 400 }
+      );
+    }
+
+    if (participantIds.length > 500) {
       return NextResponse.json(
         {
           success: false,
-          message: `Select between 1 and ${MAX_PARTICIPANTS} valid participants.`,
+          message: "A maximum of 500 certificates can be generated at once.",
         },
         { status: 400 }
       );
     }
 
-    const [event, category, template, participants] = await Promise.all([
+    if (
+      participantIds.some((participantId) =>
+        !mongoose.isValidObjectId(participantId)
+      )
+    ) {
+      return NextResponse.json(
+        { success: false, message: "One or more participant IDs are invalid." },
+        { status: 400 }
+      );
+    }
+
+    const uniqueParticipantIds = Array.from(new Set(participantIds));
+
+    await connectDB();
+
+    const [event, category, template] = await Promise.all([
       Event.findById(id).lean(),
       Category.findOne({ _id: categoryId, eventId: id }).lean(),
       CertificateTemplate.findOne({
         _id: templateId,
         eventId: id,
         categoryId,
-      }).lean(),
-      Participant.find({
-        _id: { $in: participantIds },
-        eventId: id,
-        categoryId,
-        status: "active",
-      }).lean(),
+      }),
     ]);
 
     if (!event) {
@@ -495,11 +609,12 @@ export async function POST(
       );
     }
 
-    if (participants.length !== participantIds.length) {
+    if (template.status !== "published") {
       return NextResponse.json(
         {
           success: false,
-          message: "One or more selected participants were not found or are inactive.",
+          message:
+            "This certificate template is still a draft. Publish the design before generating certificates.",
         },
         { status: 400 }
       );
@@ -509,45 +624,46 @@ export async function POST(
       return NextResponse.json(
         {
           success: false,
-          message: "Add and save at least one dynamic field in the template designer.",
+          message: "The selected template has no dynamic fields.",
         },
         { status: 400 }
       );
     }
 
-    const db = mongoose.connection.db;
+    const participants = (await Participant.find({
+      _id: { $in: uniqueParticipantIds },
+      eventId: id,
+      categoryId,
+      status: "active",
+    }).lean()) as unknown as ParticipantRecord[];
 
-    if (!db) {
-      throw new Error("MongoDB connection is unavailable.");
+    if (participants.length !== uniqueParticipantIds.length) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "Some selected participants were not found, are inactive, or do not belong to this category.",
+        },
+        { status: 400 }
+      );
     }
 
-    const templateBucket = new GridFSBucket(db, {
-      bucketName: TEMPLATE_BUCKET,
-    });
-
-    const certificateBucket = new GridFSBucket(db, {
-      bucketName: CERTIFICATE_BUCKET,
-    });
-
     const templateBuffer = await readGridFSFile(
-      templateBucket,
-      template.fileId
+      "certificateTemplates",
+      new ObjectId(String(template.fileId))
     );
 
-    const zip = new JSZip();
-    const generated: {
-      certificateId: string;
-      participantName: string;
-      fileName: string;
-    }[] = [];
+    const categoryFields = (category.fields || []) as CategoryField[];
+    const templateFields = template.fields as unknown as TemplateField[];
 
-    for (const rawParticipant of participants) {
-      const participant = rawParticipant as unknown as ParticipantData;
+    const generatedAt = new Date();
+    let generatedCount = 0;
 
+    for (const participant of participants) {
       const pdfBuffer = await createCertificatePDF(
         templateBuffer,
         template.mimeType,
-        template.fields as TemplateField[],
+        templateFields,
         participant,
         {
           name: event.name,
@@ -555,112 +671,111 @@ export async function POST(
           endDate: event.endDate,
           venue: event.venue,
           city: event.city,
-        }
+        },
+        categoryFields
       );
 
       const safeName = participant.participantName
         .replace(/[^a-z0-9-_ ]/gi, "")
         .trim()
-        .replace(/\s+/g, "_")
-        .slice(0, 80) || "Participant";
+        .replace(/\s+/g, "_");
 
-      const fileName = `${safeName}_${participant.certificateId}.pdf`;
+      const filename = `${safeName || "Participant"}_${participant.certificateId}.pdf`;
 
-      const fileId = await uploadGridFSFile(
-        certificateBucket,
+      const newFileId = await uploadGridFSFile(
+        "generatedCertificates",
         pdfBuffer,
-        fileName,
+        filename,
         {
-          eventId: id,
-          categoryId,
-          participantId: participant._id.toString(),
-          templateId,
+          eventId: new ObjectId(id),
+          categoryId: new ObjectId(categoryId),
+          participantId: participant._id,
+          templateId: template._id,
           certificateId: participant.certificateId,
-          generatedBy: admin.adminId,
+          generatedAt,
         }
       );
 
-      uploadedFileIds.push(fileId);
+      uploadedFileIds.push(newFileId);
 
-      // One current certificate record per participant.
-      // Regeneration replaces the previous PDF while preserving the ID.
-      const previous = await GeneratedCertificate.findOne({
-        certificateId: participant.certificateId,
-      }).lean();
+      const previousCertificate = await GeneratedCertificate.findOne({
+        eventId: id,
+        categoryId,
+        participantId: participant._id,
+      });
+
+      const previousFileId = previousCertificate?.fileId;
 
       await GeneratedCertificate.findOneAndUpdate(
-        { certificateId: participant.certificateId },
         {
+          eventId: id,
+          categoryId,
+          participantId: participant._id,
+        },
+        {
+          $setOnInsert: {
+            downloadCount: 0,
+            lastDownloadedAt: null,
+          },
           $set: {
             eventId: id,
             categoryId,
             participantId: participant._id,
-            templateId,
-            fileId: new mongoose.Types.ObjectId(fileId.toString()),
-            fileName,
+            templateId: template._id,
+            certificateId: participant.certificateId,
+            fileId: newFileId,
+            fileName: filename,
             fileSize: pdfBuffer.length,
             status: "generated",
             generatedBy: admin.adminId,
-            generatedAt: new Date(),
+            generatedAt,
           },
         },
-        { upsert: true, new: true, runValidators: true }
+        {
+          upsert: true,
+          new: true,
+          runValidators: true,
+          setDefaultsOnInsert: true,
+        }
       );
 
-      // Delete the previous PDF after the new record is saved.
-      if (previous?.fileId) {
+      // The new file is now referenced by the generated-certificate record.
+      uploadedFileIds.splice(uploadedFileIds.indexOf(newFileId), 1);
+
+      if (
+        previousFileId &&
+        String(previousFileId) !== String(newFileId)
+      ) {
         try {
-          await certificateBucket.delete(
-            new ObjectId(previous.fileId.toString())
+          await getBucket("generatedCertificates").delete(
+            new ObjectId(String(previousFileId))
           );
         } catch (deleteError) {
-          console.error("Old certificate file cleanup error:", deleteError);
+          console.warn(
+            "Unable to remove previous generated certificate file:",
+            deleteError
+          );
         }
       }
 
-      uploadedFileIds.splice(uploadedFileIds.indexOf(fileId), 1);
-
-      zip.file(fileName, pdfBuffer);
-
-      generated.push({
-        certificateId: participant.certificateId,
-        participantName: participant.participantName,
-        fileName,
-      });
+      generatedCount += 1;
     }
 
-    const zipBuffer = await zip.generateAsync({
-      type: "nodebuffer",
-      compression: "DEFLATE",
-      compressionOptions: { level: 6 },
-    });
-
-    const zipName = `${event.slug}_${category.slug}_certificates.zip`;
-
-    return new Response(new Uint8Array(zipBuffer), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Disposition": `attachment; filename="${encodeURIComponent(zipName)}"`,
-        "Content-Length": String(zipBuffer.length),
-        "Cache-Control": "private, no-store",
-        "X-Certificates-Generated": String(generated.length),
-      },
+    return NextResponse.json({
+      success: true,
+      message: `Successfully generated ${generatedCount} certificate${generatedCount === 1 ? "" : "s"}.`,
+      generatedCount,
     });
   } catch (error) {
     console.error("Certificate generation error:", error);
 
-    // Clean up newly uploaded files if generation fails.
-    const db = mongoose.connection.db;
-
-    if (db && uploadedFileIds.length > 0) {
-      const bucket = new GridFSBucket(db, {
-        bucketName: CERTIFICATE_BUCKET,
-      });
-
-      await Promise.allSettled(
-        uploadedFileIds.map((fileId) => bucket.delete(fileId))
-      );
+    // Remove any newly uploaded files that were not committed to a record.
+    for (const fileId of uploadedFileIds) {
+      try {
+        await getBucket("generatedCertificates").delete(fileId);
+      } catch (cleanupError) {
+        console.error("Generated file cleanup error:", cleanupError);
+      }
     }
 
     return NextResponse.json(
