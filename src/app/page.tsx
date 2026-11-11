@@ -657,7 +657,7 @@ export default function Home() {
           </div>
 
           <p className="text-[10px] text-[#a58c7b]">
-            © {new Date().getFullYear()} Certificate Studio. All rights
+            © 2026 Certificate Studio. All rights
             reserved.
           </p>
         </div>
